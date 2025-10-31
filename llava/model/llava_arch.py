@@ -15,6 +15,7 @@
 import copy
 import json
 import logging
+import math
 import os
 import os.path as osp
 import warnings
@@ -24,9 +25,11 @@ from copy import deepcopy
 from itertools import chain
 from math import ceil, floor
 from typing import Any, Dict, List, Optional, Tuple, Union
+import numpy as np
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from hydra.utils import instantiate
@@ -46,6 +49,63 @@ from llava.train.sequence_parallel import get_pg_manager
 from llava.utils import distributed
 from llava.utils.media import extract_media
 from llava.utils.tokenizer import tokenize_conversation
+
+
+# LAPE utility functions
+def position_transfer(position, num_temporal_tokens):
+    position = np.clip(position, 0, 1)
+    embed_position = position * (num_temporal_tokens - 1)
+    floor_position = math.floor(embed_position)
+    ceil_position = math.ceil(embed_position)
+    ratio = embed_position - floor_position
+    return floor_position, ceil_position, ratio
+
+
+def token_transfer(position, temporal_embed_tokens, return_position=False):
+    position = np.clip(position, 0, 1)
+    floor_position, ceil_position, ratio = position_transfer(position, temporal_embed_tokens.shape[0])
+    ret_feature = temporal_embed_tokens[floor_position] * (1 - ratio) + temporal_embed_tokens[ceil_position] * ratio
+    if return_position:
+        return ret_feature, floor_position, ceil_position, ratio
+    else:
+        return ret_feature
+
+
+def reparam(weight, reparam_mat):
+    reparam_weight = reparam_mat.to(weight.dtype).to(weight.device) @ weight
+    return weight + reparam_weight - reparam_weight.detach()
+
+
+class VisionConfig:
+    def __init__(self):
+        self.slow_token = False
+        self.fast_token = False
+
+        self.frame_size = 384
+        self.patch_size = 14
+        self.hidden_size = 1024
+        self.vid_start_token = None
+        self.vid_end_token = None
+        self.vid_patch_token = None
+        self.im_start_token = None
+        self.im_end_token = None
+        self.im_patch_token = None
+
+        self.fast_token_num = 9
+        self.slow_token_num = 81
+        self.fast_frame_num = 100
+        self.slow_frame_num = 20
+
+        self.image_token_num = 729
+
+        self.spatial_token_num = 100
+
+        self.temporal_input_token_id = -1000
+        self.temporal_output_token_id = -1001
+        self.spatial_height_input_token_id = -1002
+        self.spatial_height_output_token_id = -1003
+        self.spatial_width_input_token_id = -1004
+        self.spatial_width_output_token_id = -1005
 
 
 class LlavaMetaModel(ABC):
@@ -79,6 +139,108 @@ class LlavaMetaModel(ABC):
         # XGrammar tokenizer and grammar compiler
         # lazy init only when specified json output during inference
         self.grammar_compiler = None
+
+        # Initialize LAPE support
+        self.has_init_specific_embeddings = False
+        self.vision_config = VisionConfig()
+        
+        # Initialize special embeddings if configured, with robust fallback when config fields are missing
+        if getattr(config, "num_spatial_tokens", None) is not None and getattr(config, "num_temporal_tokens", None) is not None:
+            # First add LAPE tokens to tokenizer (required before init_special_embeddings)
+            num_spatial_tokens = getattr(config, "num_spatial_tokens", 100)
+            num_temporal_tokens = getattr(config, "num_temporal_tokens", 100)
+            self.initialize_spatial_temporal_tokens(self.tokenizer, num_temporal_tokens, num_spatial_tokens)
+            # Then initialize the embedding layers
+            init_strategy = getattr(config, "lape_init_strategy", "normal")
+            self.init_special_embeddings(init_strategy)
+            
+            # Load LAPE weights if they exist (for resumed training or inference)
+            lape_weights_path = os.path.join(getattr(config, "resume_path", ""), "lape_embeddings.bin")
+            if os.path.exists(lape_weights_path):
+                print(f"Loading LAPE embeddings from {lape_weights_path}")
+                lape_state_dict = torch.load(lape_weights_path, map_location="cpu")
+                # Helper to safely load a submodule's state dict
+                def _safe_load(module, sub_sd, name):
+                    try:
+                        if isinstance(sub_sd, dict):
+                            # detect ZeRO-empty tensors
+                            wt = sub_sd.get("weight", None)
+                            if wt is not None and hasattr(wt, "numel") and wt.numel() == 0:
+                                print(f"[LAPE] Skip loading {name}: found empty weight (likely ZeRO partition). Using initialized weights.")
+                                return
+                            module.load_state_dict(sub_sd, strict=False)
+                    except Exception as e:
+                        print(f"[LAPE] Failed to load {name}: {e}. Using initialized weights.")
+
+                # Load each LAPE component
+                if "spatial_height_input_embeddings" in lape_state_dict:
+                    _safe_load(self.spatial_height_input_embeddings, lape_state_dict["spatial_height_input_embeddings"], "spatial_height_input_embeddings")
+                if "spatial_height_output_embeddings" in lape_state_dict:
+                    _safe_load(self.spatial_height_output_embeddings, lape_state_dict["spatial_height_output_embeddings"], "spatial_height_output_embeddings")
+                if "spatial_width_input_embeddings" in lape_state_dict:
+                    _safe_load(self.spatial_width_input_embeddings, lape_state_dict["spatial_width_input_embeddings"], "spatial_width_input_embeddings")
+                if "spatial_width_output_embeddings" in lape_state_dict:
+                    _safe_load(self.spatial_width_output_embeddings, lape_state_dict["spatial_width_output_embeddings"], "spatial_width_output_embeddings")
+                if "temporal_input_embeddings" in lape_state_dict:
+                    _safe_load(self.temporal_input_embeddings, lape_state_dict["temporal_input_embeddings"], "temporal_input_embeddings")
+                if "temporal_output_embeddings" in lape_state_dict:
+                    _safe_load(self.temporal_output_embeddings, lape_state_dict["temporal_output_embeddings"], "temporal_output_embeddings")
+                print("LAPE embeddings loaded (with safety checks).")
+        else:
+            # Fallback path: no num_* in config, but if a LAPE weights file exists, infer counts and initialize
+            lape_weights_path = os.path.join(getattr(config, "resume_path", ""), "lape_embeddings.bin")
+            if os.path.exists(lape_weights_path):
+                print(f"Loading LAPE embeddings from {lape_weights_path} (inferred counts)")
+                lape_state_dict = torch.load(lape_weights_path, map_location="cpu")
+                # Infer token counts from saved weights if possible
+                inferred_spatial = None
+                inferred_temporal = None
+                try:
+                    if isinstance(lape_state_dict.get("spatial_width_input_embeddings"), dict):
+                        w = lape_state_dict["spatial_width_input_embeddings"].get("weight", None)
+                        if w is not None and hasattr(w, "shape") and len(w.shape) >= 1 and w.numel() > 0:
+                            inferred_spatial = int(w.shape[0])
+                    if isinstance(lape_state_dict.get("temporal_input_embeddings"), dict):
+                        w = lape_state_dict["temporal_input_embeddings"].get("weight", None)
+                        if w is not None and hasattr(w, "shape") and len(w.shape) >= 1 and w.numel() > 0:
+                            inferred_temporal = int(w.shape[0])
+                except Exception:
+                    pass
+                # Default back to 100 if not inferrable
+                inferred_spatial = inferred_spatial or 100
+                inferred_temporal = inferred_temporal or 100
+                # Initialize tokens and embeddings
+                self.initialize_spatial_temporal_tokens(self.tokenizer, inferred_temporal, inferred_spatial)
+                init_strategy = getattr(config, "lape_init_strategy", "normal")
+                self.init_special_embeddings(init_strategy)
+                # Load as above
+                def _safe_load(module, sub_sd, name):
+                    try:
+                        if isinstance(sub_sd, dict):
+                            wt = sub_sd.get("weight", None)
+                            if wt is not None and hasattr(wt, "numel") and wt.numel() == 0:
+                                print(f"[LAPE] Skip loading {name}: found empty weight (likely ZeRO partition). Using initialized weights.")
+                                return
+                            module.load_state_dict(sub_sd, strict=False)
+                    except Exception as e:
+                        print(f"[LAPE] Failed to load {name}: {e}. Using initialized weights.")
+                if "spatial_height_input_embeddings" in lape_state_dict:
+                    _safe_load(self.spatial_height_input_embeddings, lape_state_dict["spatial_height_input_embeddings"], "spatial_height_input_embeddings")
+                if "spatial_height_output_embeddings" in lape_state_dict:
+                    _safe_load(self.spatial_height_output_embeddings, lape_state_dict["spatial_height_output_embeddings"], "spatial_height_output_embeddings")
+                if "spatial_width_input_embeddings" in lape_state_dict:
+                    _safe_load(self.spatial_width_input_embeddings, lape_state_dict["spatial_width_input_embeddings"], "spatial_width_input_embeddings")
+                if "spatial_width_output_embeddings" in lape_state_dict:
+                    _safe_load(self.spatial_width_output_embeddings, lape_state_dict["spatial_width_output_embeddings"], "spatial_width_output_embeddings")
+                if "temporal_input_embeddings" in lape_state_dict:
+                    _safe_load(self.temporal_input_embeddings, lape_state_dict["temporal_input_embeddings"], "temporal_input_embeddings")
+                if "temporal_output_embeddings" in lape_state_dict:
+                    _safe_load(self.temporal_output_embeddings, lape_state_dict["temporal_output_embeddings"], "temporal_output_embeddings")
+                # Update config for future saves
+                self.config.num_spatial_tokens = inferred_spatial
+                self.config.num_temporal_tokens = inferred_temporal
+                self.config.has_lape = True
+                print(f"LAPE embeddings loaded with inferred counts (spatial={inferred_spatial}, temporal={inferred_temporal}).")
 
         self.encoders = {}
         for name in ["image", "video"]:
@@ -198,6 +360,39 @@ class LlavaMetaModel(ABC):
                 state_dict=mm_projector_state_dict,
             )
             self.config.mm_projector_cfg = self.mm_projector.config
+        
+        # Save LAPE embeddings if they exist
+        if self.has_init_specific_embeddings:
+            print(f"saving LAPE embeddings to {osp.join(output_dir, 'lape_embeddings.bin')}")
+            lape_state_dict = OrderedDict()
+            lape_modules = [
+                "spatial_height_input_embeddings",
+                "spatial_height_output_embeddings",
+                "spatial_width_input_embeddings",
+                "spatial_width_output_embeddings",
+                "temporal_input_embeddings",
+                "temporal_output_embeddings",
+            ]
+
+            # Prefer extracting from the consolidated state_dict (safe under ZeRO)
+            for mod_name in lape_modules:
+                prefix = mod_name + "."
+                sub_sd = OrderedDict((k[len(prefix):], v) for k, v in state_dict.items() if k.startswith(prefix))
+                if len(sub_sd) == 0 and hasattr(self, mod_name):
+                    # Fallback to module.state_dict() (only if not using ZeRO partition on this rank)
+                    try:
+                        sub_sd = getattr(self, mod_name).state_dict()
+                    except Exception:
+                        sub_sd = OrderedDict()
+                lape_state_dict[mod_name] = sub_sd
+
+            torch.save(lape_state_dict, os.path.join(output_dir, "lape_embeddings.bin"))
+            
+            # Save LAPE config
+            self.config.num_spatial_tokens = self.num_spatial_tokens
+            self.config.num_temporal_tokens = self.num_temporal_tokens
+            self.config.has_lape = True
+        
         ## update and save top-level config
         self.config._name_or_path = output_dir
         self.config.architectures = [self.__class__.__name__]
@@ -363,9 +558,22 @@ class LlavaMetaModel(ABC):
 
         return image_features_each_image, new_block_sizes
 
-    def encode_images(self, images, block_sizes: Optional[Optional[Tuple[int, ...]]] = None):
+    def encode_images(self, images, block_sizes: Optional[Optional[Tuple[int, ...]]] = None,
+                     temporal_information_injection=None, spatial_height_information_injection=None, 
+                     spatial_width_information_injection=None):
+        """
+        Enhanced encode_images with LAPE support for spatial-temporal position embeddings
+        """
+        # Handle LAPE position injections (following LLaVA-ST pattern)
+        if self.has_init_specific_embeddings and temporal_information_injection is not None:
+            if spatial_height_information_injection is not None:
+                spatial_height_information_injection = spatial_height_information_injection.permute(1, 2, 0)
+            if spatial_width_information_injection is not None:
+                spatial_width_information_injection = spatial_width_information_injection.permute(1, 2, 0)
+            
         if block_sizes is None:
             block_sizes = [None] * len(images)
+            
         if getattr(self.config, "dynamic_s2", False):
             image_features = self.get_vision_tower()(images)
             image_features, new_block_sizes = self.merge_features_for_dynamic_s2(image_features, block_sizes)
@@ -377,6 +585,36 @@ class LlavaMetaModel(ABC):
             image_features = torch.cat(
                 [rearrange(x, "b c h w -> b (h w) c") for x in image_features], dim=0
             )  # B * N * C
+            
+            # Apply LAPE directly in encode_images (LLaVA-ST style)
+            if self.has_init_specific_embeddings and temporal_information_injection is not None:
+                t, hw, _ = image_features.shape
+                h = w = int(hw**0.5)
+                image_features = image_features.reshape(t, h, w, -1)
+                
+                # Interpolate spatial injections to match feature dimensions
+                if spatial_height_information_injection is not None:
+                    resize_spatial_height_information_injection = F.interpolate(
+                        spatial_height_information_injection, size=(h,), mode='linear'
+                    ).permute(0, 2, 1).unsqueeze(2)
+                else:
+                    resize_spatial_height_information_injection = 0
+                    
+                if spatial_width_information_injection is not None:
+                    resize_spatial_width_information_injection = F.interpolate(
+                        spatial_width_information_injection, size=(w,), mode='linear'
+                    ).permute(0, 2, 1).unsqueeze(1)
+                else:
+                    resize_spatial_width_information_injection = 0
+                    
+                # For images, use first temporal token
+                resize_temporal_information_injection = temporal_information_injection[0:1].unsqueeze(1) + temporal_information_injection.sum() * 0.
+                
+                # LAPE injection (direct addition as in LLaVA-ST)
+                image_features = image_features + resize_spatial_height_information_injection + resize_spatial_width_information_injection + resize_temporal_information_injection
+                
+                image_features = image_features.reshape(t, hw, -1)
+            
             image_features = self.get_mm_projector()(image_features)
             image_features = list(
                 image_features.split([block_size[0] * block_size[1] for block_size in new_block_sizes], dim=0)
@@ -390,6 +628,36 @@ class LlavaMetaModel(ABC):
                 image_features = torch.stack(image_features, dim=0)
         else:
             image_features = self.get_vision_tower()(images)
+            
+            # Apply LAPE directly in encode_images (LLaVA-ST style)
+            if self.has_init_specific_embeddings and temporal_information_injection is not None:
+                t, hw, _ = image_features.shape
+                h = w = int(hw**0.5)
+                image_features = image_features.reshape(t, h, w, -1)
+                
+                # Interpolate spatial injections to match feature dimensions
+                if spatial_height_information_injection is not None:
+                    resize_spatial_height_information_injection = F.interpolate(
+                        spatial_height_information_injection, size=(h,), mode='linear'
+                    ).permute(0, 2, 1).unsqueeze(2)
+                else:
+                    resize_spatial_height_information_injection = 0
+                    
+                if spatial_width_information_injection is not None:
+                    resize_spatial_width_information_injection = F.interpolate(
+                        spatial_width_information_injection, size=(w,), mode='linear'
+                    ).permute(0, 2, 1).unsqueeze(1)
+                else:
+                    resize_spatial_width_information_injection = 0
+                    
+                # For images, use first temporal token
+                resize_temporal_information_injection = temporal_information_injection[0:1].unsqueeze(1) + temporal_information_injection.sum() * 0.
+                
+                # LAPE injection (direct addition as in LLaVA-ST)
+                image_features = image_features + resize_spatial_height_information_injection + resize_spatial_width_information_injection + resize_temporal_information_injection
+                
+                image_features = image_features.reshape(t, hw, -1)
+                
             image_features = self.get_mm_projector()(image_features)
         return image_features
 
@@ -407,6 +675,130 @@ class LlavaMetaModel(ABC):
     def resize_token_embeddings(self, embed_size):
         self.get_llm().resize_token_embeddings(embed_size)
 
+    # LAPE Methods
+    def init_special_embeddings(self, init_strategy="normal"):
+        if self.has_init_specific_embeddings:
+            return
+        self.has_init_specific_embeddings = True
+        
+        # Get hidden size from the LLM config
+        hidden_size = self.llm.config.hidden_size
+        
+        # init spatial token embedding
+        self.spatial_height_input_embeddings = torch.nn.Embedding(self.vision_config.spatial_token_num, hidden_size)
+        self.spatial_height_output_embeddings = torch.nn.Linear(hidden_size, self.vision_config.spatial_token_num, bias=False)
+
+        self.spatial_width_input_embeddings = torch.nn.Embedding(self.vision_config.spatial_token_num, hidden_size)
+        self.spatial_width_output_embeddings = torch.nn.Linear(hidden_size, self.vision_config.spatial_token_num, bias=False)
+        
+        # init temporal token embedding
+        self.temporal_input_embeddings = torch.nn.Embedding(self.vision_config.fast_frame_num, hidden_size)
+        self.temporal_output_embeddings = torch.nn.Linear(hidden_size, self.vision_config.fast_frame_num, bias=False)
+
+        # Apply initialization strategy
+        self._apply_lape_initialization(init_strategy)
+
+        index_vec = torch.arange(self.vision_config.spatial_token_num)
+        self.spatial_width_reparam_mat = 2.**(-(index_vec[:, None] - index_vec[None]).abs())
+        self.spatial_height_reparam_mat = 2.**(-(index_vec[:, None] - index_vec[None]).abs())
+        index_vec = torch.arange(self.vision_config.fast_frame_num)
+        self.temporal_reparam_mat = 2.**(-(index_vec[:, None] - index_vec[None]).abs())
+        
+        # Update config
+        if hasattr(self, 'config'):
+            self.config.num_temporal_tokens = self.vision_config.spatial_token_num
+            self.config.num_spatial_tokens = self.vision_config.fast_frame_num
+
+    def _apply_lape_initialization(self, strategy="normal"):
+        """Apply different initialization strategies for LAPE embeddings"""
+        if strategy == "smart":
+            # Use LLM embedding statistics for smarter initialization
+            if hasattr(self.llm, 'get_input_embeddings'):
+                base_embeddings = self.llm.get_input_embeddings().weight
+                embed_mean = base_embeddings.mean().item()
+                embed_std = base_embeddings.std().item()
+                init_std = embed_std * 0.1  # Use 10% of base std for stability
+                
+                with torch.no_grad():
+                    for embed in [self.spatial_height_input_embeddings, 
+                                self.spatial_width_input_embeddings,
+                                self.temporal_input_embeddings]:
+                        torch.nn.init.normal_(embed.weight, mean=embed_mean, std=init_std)
+                        
+                    # Initialize output layers with smaller variance
+                    for linear in [self.spatial_height_output_embeddings,
+                                 self.spatial_width_output_embeddings, 
+                                 self.temporal_output_embeddings]:
+                        torch.nn.init.normal_(linear.weight, mean=0, std=init_std * 0.5)
+                        
+                print(f"Applied smart LAPE initialization with mean={embed_mean:.4f}, std={init_std:.4f}")
+                
+        elif strategy == "zero":
+            # Zero initialization for very conservative start
+            with torch.no_grad():
+                for embed in [self.spatial_height_input_embeddings, 
+                            self.spatial_width_input_embeddings,
+                            self.temporal_input_embeddings]:
+                    torch.nn.init.zeros_(embed.weight)
+                    
+                for linear in [self.spatial_height_output_embeddings,
+                             self.spatial_width_output_embeddings, 
+                             self.temporal_output_embeddings]:
+                    torch.nn.init.zeros_(linear.weight)
+                    
+            print("Applied zero LAPE initialization")
+            
+        else:  # strategy == "normal"
+            # Default PyTorch initialization
+            print("Applied normal LAPE initialization")
+
+    def initialize_spatial_temporal_tokens(self, tokenizer, num_temporal_tokens, num_spatial_tokens):
+        """Initialize LAPE spatial and temporal tokens for VILA"""
+        from llava.constants import (
+            TEMPORAL_INPUT_TOKEN, TEMPORAL_OUTPUT_TOKEN, 
+            SPATIAL_HEIGHT_INPUT_TOKEN, SPATIAL_HEIGHT_OUTPUT_TOKEN,
+            SPATIAL_WIDTH_INPUT_TOKEN, SPATIAL_WIDTH_OUTPUT_TOKEN,
+            TEMPORAL_TOKEN_FORMAT, SPATIAL_HEIGHT_TOKEN_FORMAT, SPATIAL_WIDTH_TOKEN_FORMAT
+        )
+        
+        vision_config = self.vision_config
+        self.num_temporal_tokens = num_temporal_tokens
+        self.num_spatial_tokens = num_spatial_tokens
+        self.temporal_tokens = [TEMPORAL_TOKEN_FORMAT.format(i) for i in range(num_temporal_tokens)]
+        self.spatial_height_tokens = [SPATIAL_HEIGHT_TOKEN_FORMAT.format(i) for i in range(num_spatial_tokens)]
+        self.spatial_width_tokens = [SPATIAL_WIDTH_TOKEN_FORMAT.format(i) for i in range(num_spatial_tokens)]
+        
+        # Add special tokens
+        num_new_tokens = tokenizer.add_tokens([
+            TEMPORAL_INPUT_TOKEN, TEMPORAL_OUTPUT_TOKEN, 
+            SPATIAL_HEIGHT_INPUT_TOKEN, SPATIAL_HEIGHT_OUTPUT_TOKEN, 
+            SPATIAL_WIDTH_INPUT_TOKEN, SPATIAL_WIDTH_OUTPUT_TOKEN
+        ], special_tokens=True)
+        
+        # Get token IDs
+        vision_config.temporal_input_token_id = tokenizer.convert_tokens_to_ids([TEMPORAL_INPUT_TOKEN])[0]
+        vision_config.temporal_output_token_id = tokenizer.convert_tokens_to_ids([TEMPORAL_OUTPUT_TOKEN])[0]
+        vision_config.spatial_height_input_token_id = tokenizer.convert_tokens_to_ids([SPATIAL_HEIGHT_INPUT_TOKEN])[0]
+        vision_config.spatial_height_output_token_id = tokenizer.convert_tokens_to_ids([SPATIAL_HEIGHT_OUTPUT_TOKEN])[0]
+        vision_config.spatial_width_input_token_id = tokenizer.convert_tokens_to_ids([SPATIAL_WIDTH_INPUT_TOKEN])[0]
+        vision_config.spatial_width_output_token_id = tokenizer.convert_tokens_to_ids([SPATIAL_WIDTH_OUTPUT_TOKEN])[0]
+        
+        # Add position tokens
+        _ = tokenizer.add_tokens(self.temporal_tokens, special_tokens=True)
+        _ = tokenizer.add_tokens(self.spatial_height_tokens, special_tokens=True)
+        _ = tokenizer.add_tokens(self.spatial_width_tokens, special_tokens=True)
+
+        # Neighboring Token Propagation (NTP)
+        index_vec = torch.arange(num_spatial_tokens)
+        self.spatial_width_reparam_mat = 2.**(-(index_vec[:, None] - index_vec[None]).abs())
+        self.spatial_height_reparam_mat = 2.**(-(index_vec[:, None] - index_vec[None]).abs())
+        index_vec = torch.arange(num_temporal_tokens)
+        self.temporal_reparam_mat = 2.**(-(index_vec[:, None] - index_vec[None]).abs())
+
+        self.config.num_spatial_tokens = self.num_spatial_tokens
+        self.config.num_temporal_tokens = self.num_temporal_tokens
+        return num_new_tokens
+
 
 class LlavaMetaForCausalLM(ABC):
     def _embed(
@@ -416,6 +808,7 @@ class LlavaMetaForCausalLM(ABC):
         media_config: Dict[str, Dict[str, Any]],
         labels: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        variables: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         labels = labels if labels is not None else torch.full_like(input_ids, IGNORE_INDEX)
         attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids, dtype=torch.bool)
@@ -427,6 +820,43 @@ class LlavaMetaForCausalLM(ABC):
 
         # Extract text and media embeddings
         text_embeds = self.llm.model.embed_tokens(input_ids)
+
+        # If variables provided and LAPE is initialized, prepare temporal injection tensors for image encoding
+        # (LLaVA-ST style). We'll apply control-token embedding replacement after removing padding below.
+        if variables is not None and self.has_init_specific_embeddings:
+            batch_size = input_ids.shape[0]
+            device = text_embeds.device
+            dtype = text_embeds.dtype
+
+            # Collect per-image temporal injection vectors in the same flattened order as collator flattens media
+            temporal_injection_list: List[torch.Tensor] = []
+            image_token_id = self.tokenizer.media_token_ids.get("image")
+
+            for k in range(batch_size):
+                vars_k = variables[k] if isinstance(variables, list) and k < len(variables) else None
+
+                # Prepare temporal injection vector per image occurrence for this instance (use first temporal input if available)
+                if image_token_id is not None:
+                    num_images = (input_ids[k] == image_token_id).sum().item()
+                else:
+                    num_images = 0
+                if num_images > 0:
+                    if vars_k is not None and len(vars_k.get("temporal_input_locations", [])) > 0:
+                        tval = float(vars_k["temporal_input_locations"][0])
+                        tvec = token_transfer(tval, self.temporal_input_embeddings.weight).to(device=device, dtype=dtype)
+                    else:
+                        # fallback: zero vector
+                        tvec = torch.zeros(self.llm.config.hidden_size, device=device, dtype=dtype)
+                    # repeat for each image token of this instance
+                    for _ in range(num_images):
+                        temporal_injection_list.append(tvec)
+
+            # Attach temporal injection into media_config for image encoder to consume
+            if len(temporal_injection_list) > 0:
+                media_config = copy.deepcopy(media_config) if media_config is not None else defaultdict(dict)
+                media_config.setdefault("image", {})
+                media_config["image"]["temporal_information_injection"] = torch.stack(temporal_injection_list, dim=0)
+
         media_embeds = self.__embed_media_tokens(media, media_config)
 
         if PROCESS_GROUP_MANAGER is not None:
@@ -448,6 +878,34 @@ class LlavaMetaForCausalLM(ABC):
         batch_size = labels.shape[0]
         text_embeds = [text_embeds[k][attention_mask[k]] for k in range(batch_size)]
         labels = [labels[k][attention_mask[k]] for k in range(batch_size)]
+
+        # Now apply control-token embedding replacement on the unpadded sequences
+        if variables is not None and self.has_init_specific_embeddings:
+            for k in range(batch_size):
+                vars_k = variables[k] if isinstance(variables, list) and k < len(variables) else None
+                if vars_k is None:
+                    continue
+                ids_k = input_ids[k][attention_mask[k]]
+                emb_k = text_embeds[k]
+                device = emb_k.device
+                dtype = emb_k.dtype
+
+                def _replace_embeddings_for_token(pos_token_id: int, values: List[float], table: torch.nn.Embedding):
+                    if pos_token_id < 0 or values is None:
+                        return
+                    ptr = 0
+                    for pos_idx in range(ids_k.shape[0]):
+                        if ids_k[pos_idx].item() == pos_token_id:
+                            if ptr < len(values):
+                                v = float(values[ptr])
+                                vec = token_transfer(v, table.weight).to(device=device, dtype=dtype)
+                                emb_k[pos_idx] = vec
+                            ptr += 1
+
+                vc = self.vision_config
+                _replace_embeddings_for_token(vc.temporal_input_token_id, vars_k.get("temporal_input_locations", []), self.temporal_input_embeddings)
+                _replace_embeddings_for_token(vc.spatial_height_input_token_id, vars_k.get("spatial_height_input_locations", []), self.spatial_height_input_embeddings)
+                _replace_embeddings_for_token(vc.spatial_width_input_token_id, vars_k.get("spatial_width_input_locations", []), self.spatial_width_input_embeddings)
 
         # Build inverse mapping from token ID to media name
         media_tokens = {}

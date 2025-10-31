@@ -65,7 +65,13 @@ class BasicImageEncoder(BaseEncoder):
                 original_image_sizes,
             )
         else:
-            features = self.parent.encode_images(images, block_sizes=config.get("block_sizes"))
+            features = self.parent.encode_images(
+                images,
+                block_sizes=config.get("block_sizes"),
+                temporal_information_injection=config.get("temporal_information_injection"),
+                spatial_height_information_injection=config.get("spatial_height_information_injection"),
+                spatial_width_information_injection=config.get("spatial_width_information_injection"),
+            )
 
         process_features = partial(
             self._process_features,

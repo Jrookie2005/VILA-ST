@@ -78,6 +78,19 @@ class ModelArguments:
     top_down_prompt_head_type: Optional[str] = field(default="mlp")
     high_res_pos_embed: bool = field(default=False)
     ps3_dynamic_aspect_ratio: bool = field(default=False)
+    
+    # LAPE (Learnable Absolute Position Embeddings) configs
+    enable_lape: bool = field(default=False, metadata={"help": "Enable LAPE spatial-temporal position embeddings"})
+    num_spatial_tokens: int = field(default=100, metadata={"help": "Number of spatial position tokens for LAPE"})
+    num_temporal_tokens: int = field(default=100, metadata={"help": "Number of temporal position tokens for LAPE"})
+    
+    # Advanced LAPE configs for domain adaptation
+    lape_warmup_steps: int = field(default=1000, metadata={"help": "Number of warmup steps for LAPE parameters"})
+    lape_lr_multiplier: float = field(default=1.0, metadata={"help": "Learning rate multiplier for LAPE parameters"})
+    spatial_pos_weight: float = field(default=1.0, metadata={"help": "Weight for spatial position embeddings"})
+    temporal_pos_weight: float = field(default=1.0, metadata={"help": "Weight for temporal position embeddings"})
+    lape_init_strategy: str = field(default="normal", metadata={"help": "LAPE initialization strategy: normal, smart, or zero"})
+    
     # Quantization and low precision training
     quantize_model: Optional[str] = field(default="false")
     symm: Optional[bool] = field(default=True)
@@ -85,6 +98,9 @@ class ModelArguments:
     epsilon: Optional[float] = field(default=1e-10)
     fabit: Optional[str] = field(default="E4M3")
     fwbit: Optional[str] = field(default="E4M3")
+    fobit: Optional[str] = field(default="E4M3")
+    babit: Optional[str] = field(default="E5M2")
+    bwbit: Optional[str] = field(default="E5M2")
     bobit: Optional[str] = field(default="E5M2")
     row_blocksize: Optional[int] = -1  # -1 means only 1 quantization group along row axis
     col_blocksize: Optional[int] = -1  # -1 means only 1 quantization group along column axis
@@ -109,85 +125,6 @@ class ModelArguments:
 
     # Memory Efficient FP8 related
     Ubit: str = field(default="100")
-    quantize_model: str = field(default="false", metadata={"help": "Enable model quantization"})
-    symm: bool = field(default=True, metadata={"help": "Use symmetric quantization"})
-    epsilon: float = field(default=1e-10, metadata={"help": "Small epsilon for numerical stability"})
-    fabit: str = field(default="E4M3", metadata={"help": "Bit format for forward activation"})
-    fwbit: str = field(default="E4M3", metadata={"help": "Bit format for forward weights"})
-    fobit: str = field(default="E4M3", metadata={"help": "Bit format for forward output"})
-    babit: str = field(default="E5M2", metadata={"help": "Bit format for backward activation"})
-    bwbit: str = field(default="E5M2", metadata={"help": "Bit format for backward weights"})
-    bobit: str = field(default="E5M2", metadata={"help": "Bit format for backward output"})
-    qchoice: str = field(default="none", metadata={"help": "Quantization choice"})
-    group_size: int = field(default=-1, metadata={"help": "Group size for quantization"})
-    weight_memory_efficient: bool = field(default=True, metadata={"help": "Enable memory-efficient weights"})
-
-    min_blockunit_row: int = field(default=4)
-    min_blockunit_col: int = field(default=4)
-    refine_residual_fp: bool = field(default=False)
-    refine_ln_pertoken: bool = field(default=False)
-    refine_ln_blocksize: bool = field(default=False)
-    refine_ln_blocksize_but_only_forward: bool = field(default=False)
-    refine_ln_blocksize_but_only_backward: bool = field(default=False)
-    refine_attn_blocksize: bool = field(default=False)
-    refine_mlp_blocksize: bool = field(default=False)
-    refine_row_blocksize: int = field(default=4)
-    refine_col_blocksize: int = field(default=4)
-    draw_distribution_forward: bool = field(default=False)
-    draw_distribution_backward: bool = field(default=False)
-
-    # Quantize Optimizer Related
-    use_quantize_optimizer: bool = field(default=False)
-    row_blocksize_optimizer: int = field(default=1)
-    col_blocksize_optimizer: int = field(default=128)
-    pad_block: bool = field(default=False)
-    first_order_bit: Optional[str] = field(default=None)
-    first_order_quant_type: Optional[str] = field(default=None)
-    second_order_bit: Optional[str] = field(default=None)
-    second_order_quant_type: Optional[str] = field(default=None)
-    epsilon_optimizer: float = field(default=1e-15)
-
-    # Quantization and low precision training
-    quantize_model: Optional[str] = field(default="false")
-    symm: Optional[bool] = field(default=True)
-
-    epsilon: Optional[float] = field(default=1e-10)
-    fabit: Optional[str] = field(default="E4M3")
-    fwbit: Optional[str] = field(default="E4M3")
-    bobit: Optional[str] = field(default="E5M2")
-    row_blocksize: Optional[int] = -1  # -1 means only 1 quantization group along row axis
-    col_blocksize: Optional[int] = -1  # -1 means only 1 quantization group along column axis
-    qchoice: Optional[list[str]] = field(
-        default_factory=lambda: [
-            "none",
-            "all",
-            "linear",
-            "mlp",
-            "attn",
-            "gelu",
-            "layernorm",
-            "backbone",
-            "residual",
-            "backbone",
-        ],
-    )
-
-    pad_to_multiple_of: int = (
-        0  # if sequence length * batch size can not be divided by 128, the triton implementation of fp8 matmul when calculating weight gradient will become highly inefficient. Therefore, I want to pad the sequence length to a multiple of some exponent of 2. This will be used in prepare_inputs_labels_for_multimodal()
-    )
-
-    # Memory Efficient FP8 related
-    Ubit: str = field(default="100")
-    quantize_model: str = field(default="false", metadata={"help": "Enable model quantization"})
-    symm: bool = field(default=True, metadata={"help": "Use symmetric quantization"})
-    epsilon: float = field(default=1e-10, metadata={"help": "Small epsilon for numerical stability"})
-    fabit: str = field(default="E4M3", metadata={"help": "Bit format for forward activation"})
-    fwbit: str = field(default="E4M3", metadata={"help": "Bit format for forward weights"})
-    fobit: str = field(default="E4M3", metadata={"help": "Bit format for forward output"})
-    babit: str = field(default="E5M2", metadata={"help": "Bit format for backward activation"})
-    bwbit: str = field(default="E5M2", metadata={"help": "Bit format for backward weights"})
-    bobit: str = field(default="E5M2", metadata={"help": "Bit format for backward output"})
-    qchoice: str = field(default="none", metadata={"help": "Quantization choice"})
     group_size: int = field(default=-1, metadata={"help": "Group size for quantization"})
     weight_memory_efficient: bool = field(default=True, metadata={"help": "Enable memory-efficient weights"})
 

@@ -377,6 +377,12 @@ class LazySupervisedDataset(Dataset):
             # data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
             # vila way
             data_dict["image"] = None
+
+        # Pass through LAPE variables if present in the sample (conversations+variables format)
+        if isinstance(self.list_data_dict[i], dict) and "variables" in self.list_data_dict[i]:
+            data_dict["variables"] = self.list_data_dict[i]["variables"]
+        else:
+            data_dict["variables"] = None
         return data_dict
 
 

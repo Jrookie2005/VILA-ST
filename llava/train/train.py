@@ -575,6 +575,8 @@ def train():
     if training_args.use_one_logger:
         one_logger_callback_utils.on_model_init_end()
 
+    # NOTE: LAPE initialization moved after tokenizer is created.
+
     if not resume_path or training_args.lora_enable:
         if model_args.mlp_path is not None:
             state_dict = torch.load(model_args.mlp_path, map_location="cpu")
@@ -755,6 +757,47 @@ def train():
             special_tokens_dict=dict(pad_token="[PAD]"),
             tokenizer=tokenizer,
             model=model.llm,
+        )
+
+    # Initialize LAPE if configured (now that tokenizer is available)
+    if getattr(model_args, 'enable_lape', False):
+        mprint("Initializing LAPE (Learnable Absolute Position Embeddings)...")
+
+        # Get spatial and temporal token numbers from model args
+        num_spatial_tokens = getattr(model_args, 'num_spatial_tokens', 100)
+        num_temporal_tokens = getattr(model_args, 'num_temporal_tokens', 100)
+        init_strategy = getattr(model_args, 'lape_init_strategy', 'normal')
+
+        # Add LAPE tokens to tokenizer and resize embeddings
+        if hasattr(model, 'initialize_spatial_temporal_tokens'):
+            try:
+                num_new_tokens = model.initialize_spatial_temporal_tokens(
+                    tokenizer, num_temporal_tokens, num_spatial_tokens
+                )
+                mprint(f"Added {num_new_tokens} LAPE tokens to tokenizer")
+                if num_new_tokens and num_new_tokens > 0:
+                    model.resize_token_embeddings(len(tokenizer))
+            except Exception as e:
+                mprint(f"Warning: initialize_spatial_temporal_tokens failed: {e}")
+
+        # Initialize special embeddings with chosen strategy (if implemented)
+        if hasattr(model, 'init_special_embeddings'):
+            try:
+                model.init_special_embeddings(init_strategy)
+                mprint(f"LAPE special embeddings initialized with '{init_strategy}' strategy")
+            except Exception as e:
+                mprint(f"Warning: init_special_embeddings failed: {e}")
+
+        # Log additional LAPE configuration for visibility
+        lape_warmup_steps = getattr(model_args, 'lape_warmup_steps', 1000)
+        lape_lr_multiplier = getattr(model_args, 'lape_lr_multiplier', 1.0)
+        spatial_pos_weight = getattr(model_args, 'spatial_pos_weight', 1.0)
+        temporal_pos_weight = getattr(model_args, 'temporal_pos_weight', 1.0)
+        mprint(
+            f"LAPE configuration: warmup_steps={lape_warmup_steps}, "
+            f"lr_multiplier={lape_lr_multiplier}, "
+            f"spatial_weight={spatial_pos_weight}, "
+            f"temporal_weight={temporal_pos_weight}"
         )
     if model_args.version in conversation_lib.conv_templates:
         conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]

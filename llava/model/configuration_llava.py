@@ -64,11 +64,18 @@ class LlavaConfig(PretrainedConfig):
         ### End of PS3 configs ###
         num_time_tokens=None,
         time_token_format=None,
+        # LAPE configs (optional and backward-compatible)
+        has_lape: bool = False,
+        num_spatial_tokens: Optional[int] = None,
+        num_temporal_tokens: Optional[int] = None,
+        lape_init_strategy: Optional[str] = None,
         image_encoder: str = '{"_target_": "llava.model.encoders.BasicImageEncoder"}',
         video_encoder: str = '{"_target_": "llava.model.encoders.BasicVideoEncoder"}',
         **kwargs,
     ):
-        super().__init__()
+        # Preserve and store any extra config fields from saved config.json
+        # so custom attributes (like LAPE) are not dropped during load
+        super().__init__(**kwargs)
         self.architectures = architectures
         self.llm_cfg = llm_cfg
         self.vision_tower_cfg = vision_tower_cfg
@@ -110,6 +117,12 @@ class LlavaConfig(PretrainedConfig):
 
         self.image_encoder = image_encoder
         self.video_encoder = video_encoder
+
+        # LAPE fields (will be present if saved by a LAPE-enabled model)
+        self.has_lape = has_lape
+        self.num_spatial_tokens = num_spatial_tokens
+        self.num_temporal_tokens = num_temporal_tokens
+        self.lape_init_strategy = lape_init_strategy
 
 
 class JsonSchemaResponseFormat(BaseModel):

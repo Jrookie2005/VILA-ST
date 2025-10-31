@@ -21,6 +21,7 @@ class DataCollator:
     def __call__(self, instances: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         # Gather everything from the batch
         input_ids, labels, media, block_sizes = [], [], {name: [] for name in self.tokenizer.media_tokens}, []
+        variables = []
         for instance in instances:
             if isinstance(instance["input_ids"], torch.Tensor):
                 input_ids.append(instance["input_ids"])
@@ -35,6 +36,8 @@ class DataCollator:
                     block_sizes.append(
                         [None for _ in range(len(instance.get("image")))] if instance.get("image") is not None else []
                     )
+                # Variables: keep one-per-instance (no flattening here)
+                variables.append(instance.get("variables", None))
             else:
                 input_ids.extend(instance["input_ids"])
                 labels.extend(instance["labels"])
@@ -50,6 +53,8 @@ class DataCollator:
                         if instance.get("image") is not None
                         else [[] for _ in range(len(instance["input_ids"]))]
                     )
+                # For packed samples (COYO-style), variables are not supported; fill Nones matching the number of samples
+                variables.extend([None for _ in range(len(instance["input_ids"]))])
 
         batch_size = len(input_ids)
 
@@ -156,4 +161,6 @@ class DataCollator:
             "labels": labels,
             "attention_mask": attention_mask,
             "gt_selection_maps": gt_selection_maps,
+            # Pass variables to model for LAPE control-token replacement and optional injection construction
+            "variables": variables,
         }

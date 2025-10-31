@@ -30,7 +30,7 @@ from llava.utils.logging import logger
 
 from ...train.utils import calculate_loss_weight
 from ..configuration_llava import LlavaConfig
-from ..llava_arch import LlavaMetaForCausalLM, LlavaMetaModel
+from ..llava_arch import LlavaMetaForCausalLM, LlavaMetaModel, position_transfer, reparam
 
 
 class LlavaLlamaConfig(LlavaConfig):
@@ -97,6 +97,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
         media: Optional[Dict[str, List[torch.Tensor]]] = None,
         images: Optional[torch.FloatTensor] = None,
         media_config: Optional[List] = None,
+        variables: Optional[List[dict]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -120,7 +121,14 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
             media_config = defaultdict(dict)
 
         if inputs_embeds is None:
-            inputs_embeds, labels, attention_mask = self._embed(input_ids, media, media_config, labels, attention_mask)
+            inputs_embeds, labels, attention_mask = self._embed(
+                input_ids,
+                media,
+                media_config,
+                labels,
+                attention_mask,
+                variables=variables,
+            )
 
         if force_packing or (packing and self.training and not dpo_forward):
             if seqlens_in_batch is None:
@@ -137,16 +145,128 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
             position_ids=position_ids,
             past_key_values=past_key_values,
             labels=labels,
-            **kwargs,
+            **{k: v for k, v in kwargs.items() if k not in ["variables"]},
         )
 
-        if self.training and getattr(self.config, "time_token_ids", []):
-            outputs.loss = soft_cross_entropy(
-                outputs.logits,
-                labels,
-                soft_tokens=self.config.time_token_ids,
-                std=self.config.soft_ce_std,
+        # LAPE soft-label supervision for OUTPUT tokens (align with llava_qwen)
+        # Trigger when: training, labels provided, variables provided for all instances, and LAPE is initialized
+        if (
+            self.training
+            and labels is not None
+            and variables is not None
+            and all(v is not None for v in variables)
+            and getattr(self, "has_init_specific_embeddings", False)
+        ):
+            hidden_states = outputs.logits.new_tensor(0)  # placeholder to get device/dtype
+            # Re-run backbone to fetch last hidden states (logits alone are insufficient for soft targets over extended heads)
+            base_out = self.llm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                labels=None,
+                output_hidden_states=True,
+                use_cache=False,
             )
+            if hasattr(base_out, "hidden_states") and base_out.hidden_states is not None:
+                hidden_states = base_out.hidden_states[-1]
+            else:
+                hidden_states = None
+
+            if hidden_states is not None:
+                # Build extended output weight: [base_vocab; temporal_out; spatial_h_out; spatial_w_out]
+                base_w = self.get_lm_head().weight  # [V, H]
+                temp_w = reparam(self.temporal_output_embeddings.weight, self.temporal_reparam_mat)
+                sh_w = reparam(self.spatial_height_output_embeddings.weight, self.spatial_height_reparam_mat)
+                sw_w = reparam(self.spatial_width_output_embeddings.weight, self.spatial_width_reparam_mat)
+                ext_w = torch.cat([
+                    base_w.to(hidden_states.device, hidden_states.dtype),
+                    temp_w.to(hidden_states.device, hidden_states.dtype),
+                    sh_w.to(hidden_states.device, hidden_states.dtype),
+                    sw_w.to(hidden_states.device, hidden_states.dtype),
+                ], dim=0)
+
+                logits_ext = torch.nn.functional.linear(hidden_states, ext_w)  # [B, T, V+extra]
+                shift_logits = logits_ext[..., :-1, :].contiguous().view(-1, logits_ext.shape[-1])
+
+                B = labels.shape[0]
+                V = base_w.shape[0]
+                T_out = getattr(self, "num_temporal_tokens", getattr(self.config, "num_temporal_tokens", 100))
+                S_out = getattr(self, "num_spatial_tokens", getattr(self.config, "num_spatial_tokens", 100))
+                vc = self.vision_config
+
+                total_loss = 0.0
+                total_count = 0
+
+                for b in range(B):
+                    cur_labels = labels[b]
+                    t_idx = torch.where(cur_labels == vc.temporal_output_token_id)[0]
+                    sh_idx = torch.where(cur_labels == vc.spatial_height_output_token_id)[0]
+                    sw_idx = torch.where(cur_labels == vc.spatial_width_output_token_id)[0]
+
+                    cur_vars = variables[b]
+                    t_vals = cur_vars.get("temporal_output_locations", []) if cur_vars is not None else []
+                    sh_vals = cur_vars.get("spatial_height_output_locations", []) if cur_vars is not None else []
+                    sw_vals = cur_vars.get("spatial_width_output_locations", []) if cur_vars is not None else []
+
+                    cur_logits = logits_ext[b:b+1]
+                    cur_shift_logits = cur_logits[..., :-1, :].contiguous().view(-1, logits_ext.shape[-1])
+
+                    cur_labels_shift = cur_labels[1:].contiguous()
+                    N = cur_labels_shift.shape[0]
+                    target = torch.zeros(N, V + T_out + 2 * S_out, device=cur_shift_logits.device, dtype=cur_shift_logits.dtype)
+                    valid_mask = (cur_labels_shift != -100)
+                    idxs = torch.where(valid_mask)[0]
+                    if idxs.numel() > 0:
+                        target[idxs, cur_labels_shift[idxs]] = 1.0
+
+                    for i, pos in enumerate(t_idx):
+                        if pos.item() == 0 or (pos.item() - 1) >= N:
+                            continue
+                        if i >= len(t_vals):
+                            continue
+                        floor_p, ceil_p, ratio = position_transfer(float(t_vals[i]), T_out)
+                        si = pos.item() - 1
+                        target[si, vc.temporal_output_token_id] = 0.0
+                        target[si, V + floor_p] = 1.0 - ratio
+                        if floor_p != ceil_p:
+                            target[si, V + ceil_p] = ratio
+
+                    for i, pos in enumerate(sh_idx):
+                        if pos.item() == 0 or (pos.item() - 1) >= N:
+                            continue
+                        if i >= len(sh_vals):
+                            continue
+                        floor_p, ceil_p, ratio = position_transfer(float(sh_vals[i]), S_out)
+                        si = pos.item() - 1
+                        target[si, vc.spatial_height_output_token_id] = 0.0
+                        base = V + T_out
+                        target[si, base + floor_p] = 1.0 - ratio
+                        if floor_p != ceil_p:
+                            target[si, base + ceil_p] = ratio
+
+                    for i, pos in enumerate(sw_idx):
+                        if pos.item() == 0 or (pos.item() - 1) >= N:
+                            continue
+                        if i >= len(sw_vals):
+                            continue
+                        floor_p, ceil_p, ratio = position_transfer(float(sw_vals[i]), S_out)
+                        si = pos.item() - 1
+                        target[si, vc.spatial_width_output_token_id] = 0.0
+                        base = V + T_out + S_out
+                        target[si, base + floor_p] = 1.0 - ratio
+                        if floor_p != ceil_p:
+                            target[si, base + ceil_p] = ratio
+
+                    logp = torch.nn.functional.log_softmax(cur_shift_logits, dim=-1)
+                    loss_vec = -(target * logp).sum(dim=-1)
+                    loss_vec = loss_vec[valid_mask[: loss_vec.shape[0]].to(loss_vec.device)]
+                    if loss_vec.numel() > 0:
+                        total_loss = total_loss + loss_vec.mean()
+                        total_count += 1
+
+                if total_count > 0:
+                    outputs.loss = total_loss / total_count
 
         # Loss rescale for SP
         if get_pg_manager() is not None:

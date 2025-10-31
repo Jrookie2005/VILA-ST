@@ -3,3 +3,15 @@ dummy:
     _target_: llava.data.DummyDataset
     num_instances: 10000
     comments: dummy dataset for testing
+agromind:
+    _target_: llava.data.LLaVADataset
+    data_path: /home-ssd/Users/gm_zzw/zjr/AgroLLaVA/AgroMind_train/converted_json/train.json
+    media_dir: /home-ssd/Users/gm_zzw/zjr/AgroLLaVA/AgroMind_train
+agromind_concat:
+    _target_: llava.data.LLaVADataset
+    data_path: /home-ssd/Users/gm_zzw/zjr/AgroLLaVA/AgroMind_train/concat_converted_json/concat_train.json
+    media_dir: /home-ssd/Users/gm_zzw/zjr/AgroLLaVA/AgroMind_train
+agromind_lape:
+    _target_: llava.data.LLaVADataset
+    data_path: /home-ssd/Users/gm_zzw/zjr/AgroLLaVA/AgroMind_train/converted_json_lape/lape_train.json
+    media_dir: /home-ssd/Users/gm_zzw/zjr/AgroLLaVA/AgroMind_train
