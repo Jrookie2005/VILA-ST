@@ -608,7 +608,10 @@ class LlavaMetaModel(ABC):
                 [rearrange(x, "b c h w -> b (h w) c") for x in image_features], dim=0
             )  # B * N * C
             
-            # Apply LAPE directly in encode_images (LLaVA-ST style)
+            # Apply mm_projector first to match LLM hidden dimensions  
+            image_features = self.get_mm_projector()(image_features)
+            
+            # Apply LAPE after mm_projector (so dimensions match LLM hidden_size)
             if self.has_init_specific_embeddings and temporal_information_injection is not None:
                 t, hw, _ = image_features.shape
                 h = w = int(hw**0.5)
@@ -637,7 +640,7 @@ class LlavaMetaModel(ABC):
                 
                 image_features = image_features.reshape(t, hw, -1)
             
-            image_features = self.get_mm_projector()(image_features)
+            # Split back into list for downstream processing
             image_features = list(
                 image_features.split([block_size[0] * block_size[1] for block_size in new_block_sizes], dim=0)
             )
@@ -651,7 +654,10 @@ class LlavaMetaModel(ABC):
         else:
             image_features = self.get_vision_tower()(images)
             
-            # Apply LAPE directly in encode_images (LLaVA-ST style)
+            # Apply mm_projector first to match LLM hidden dimensions
+            image_features = self.get_mm_projector()(image_features)
+            
+            # Apply LAPE after mm_projector (so dimensions match LLM hidden_size)
             if self.has_init_specific_embeddings and temporal_information_injection is not None:
                 t, hw, _ = image_features.shape
                 h = w = int(hw**0.5)
@@ -679,8 +685,6 @@ class LlavaMetaModel(ABC):
                 image_features = image_features + resize_spatial_height_information_injection + resize_spatial_width_information_injection + resize_temporal_information_injection
                 
                 image_features = image_features.reshape(t, hw, -1)
-                
-            image_features = self.get_mm_projector()(image_features)
         return image_features
 
     ## @yunhao: is there a better way to handle function call and attributes for llm?
