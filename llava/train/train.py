@@ -507,7 +507,7 @@ def train():
         exit(0)
 
     if resume_path:
-        resume_from_checkpoint = True
+        resume_from_checkpoint = resume_path  # 修复：使用路径而不是布尔值
         if training_args.lora_enable:
             if model_args.ps3:
                 model_cls = LlavaTopDownLlamaModel
@@ -524,7 +524,7 @@ def train():
             model_cls = eval(config.architectures[0])
     else:
         ## first time training
-        resume_from_checkpoint = False
+        resume_from_checkpoint = None  # 修复：使用None而不是False
         ## llm and default multimodal model
         if model_args.ps3:
             model_cls = LlavaTopDownLlamaModel
