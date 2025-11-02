@@ -507,7 +507,7 @@ def train():
         exit(0)
 
     if resume_path:
-        resume_from_checkpoint = resume_path  # 修复：使用路径而不是布尔值
+        resume_from_checkpoint = True
         if training_args.lora_enable:
             if model_args.ps3:
                 model_cls = LlavaTopDownLlamaModel
@@ -517,16 +517,14 @@ def train():
             else:
                 model_cls = LlavaLlamaModel
                 config = LlavaLlamaConfig.from_pretrained(model_args.model_name_or_path, resume=resume_from_checkpoint)
-            config.resume_path = model_args.model_name_or_path  # 用于LAPE权重加载的基础模型路径
-            config._resume_from_checkpoint = resume_path  # 传递checkpoint路径用于LAPE权重加载
+            config.resume_path = model_args.model_name_or_path
         else:
             config = AutoConfig.from_pretrained(resume_path, trust_remote_code=True)
-            config.resume_path = model_args.model_name_or_path  # 修复：用基础模型路径而不是checkpoint路径
-            config._resume_from_checkpoint = resume_path  # 传递checkpoint路径用于LAPE权重加载
+            config.resume_path = resume_path
             model_cls = eval(config.architectures[0])
     else:
         ## first time training
-        resume_from_checkpoint = None  # 修复：使用None而不是False
+        resume_from_checkpoint = False
         ## llm and default multimodal model
         if model_args.ps3:
             model_cls = LlavaTopDownLlamaModel
