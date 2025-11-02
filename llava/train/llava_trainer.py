@@ -855,6 +855,67 @@ class LLaVATrainer(Trainer):
 
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
 
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        """Override to save LAPE embeddings in checkpoints"""
+        # Save the regular checkpoint first
+        result = super()._save(output_dir, state_dict)
+        
+        # Additionally save LAPE embeddings if they exist
+        if hasattr(self.model, 'has_init_specific_embeddings') and self.model.has_init_specific_embeddings:
+            if output_dir is None:
+                output_dir = self.args.output_dir
+                
+            import os
+            import torch
+            from collections import OrderedDict
+            
+            print(f"Saving LAPE embeddings to checkpoint at {output_dir}")
+            
+            # Get model state dict (handles distributed training properly)
+            if state_dict is None:
+                if hasattr(self.model, "module"):
+                    model = self.model.module
+                else:
+                    model = self.model
+                state_dict = model.state_dict()
+            
+            # Extract LAPE embeddings from state dict
+            lape_state_dict = OrderedDict()
+            lape_modules = [
+                "spatial_height_input_embeddings",
+                "spatial_height_output_embeddings", 
+                "spatial_width_input_embeddings",
+                "spatial_width_output_embeddings",
+                "temporal_input_embeddings",
+                "temporal_output_embeddings",
+            ]
+            
+            for mod_name in lape_modules:
+                prefix = mod_name + "."
+                sub_sd = OrderedDict((k[len(prefix):], v) for k, v in state_dict.items() if k.startswith(prefix))
+                if len(sub_sd) > 0:
+                    lape_state_dict[mod_name] = sub_sd
+            
+            # Save LAPE embeddings to checkpoint directory
+            if len(lape_state_dict) > 0:
+                lape_path = os.path.join(output_dir, "lape_embeddings.bin")
+                torch.save(lape_state_dict, lape_path)
+                print(f"LAPE embeddings saved to {lape_path}")
+                
+                # Also save LAPE config info
+                if hasattr(self.model, 'num_spatial_tokens') and hasattr(self.model, 'num_temporal_tokens'):
+                    lape_config = {
+                        'num_spatial_tokens': getattr(self.model, 'num_spatial_tokens', 100),
+                        'num_temporal_tokens': getattr(self.model, 'num_temporal_tokens', 100),
+                        'has_lape': True
+                    }
+                    config_path = os.path.join(output_dir, "lape_config.json")
+                    import json
+                    with open(config_path, 'w') as f:
+                        json.dump(lape_config, f, indent=2)
+        
+        return result
+
 
 class LLaVATopDownTrainer(LLaVATrainer):
 

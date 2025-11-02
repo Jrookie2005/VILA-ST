@@ -155,8 +155,30 @@ class LlavaMetaModel(ABC):
             self.init_special_embeddings(init_strategy)
             
             # Load LAPE weights if they exist (for resumed training or inference)
-            lape_weights_path = os.path.join(getattr(config, "resume_path", ""), "lape_embeddings.bin")
-            if os.path.exists(lape_weights_path):
+            # Try multiple possible locations for LAPE weights
+            lape_weights_paths = []
+            
+            # 1. From config.resume_path (for initial model loading)
+            if getattr(config, "resume_path", ""):
+                lape_weights_paths.append(os.path.join(config.resume_path, "lape_embeddings.bin"))
+            
+            # 2. From checkpoint path (for resume from checkpoint) - passed as resume parameter
+            if hasattr(config, '_resume_from_checkpoint') and config._resume_from_checkpoint:
+                lape_weights_paths.append(os.path.join(config._resume_from_checkpoint, "lape_embeddings.bin"))
+            
+            # 3. If config has a resume parameter (from LlavaLlamaConfig.from_pretrained)
+            resume_param = getattr(config, 'resume', None)
+            if resume_param and isinstance(resume_param, str):
+                lape_weights_paths.append(os.path.join(resume_param, "lape_embeddings.bin"))
+            
+            # Try to load from the first existing path
+            lape_weights_path = None
+            for path in lape_weights_paths:
+                if os.path.exists(path):
+                    lape_weights_path = path
+                    break
+            
+            if lape_weights_path:
                 print(f"Loading LAPE embeddings from {lape_weights_path}")
                 lape_state_dict = torch.load(lape_weights_path, map_location="cpu")
                 # Helper to safely load a submodule's state dict

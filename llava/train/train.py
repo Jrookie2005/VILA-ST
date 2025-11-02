@@ -517,10 +517,12 @@ def train():
             else:
                 model_cls = LlavaLlamaModel
                 config = LlavaLlamaConfig.from_pretrained(model_args.model_name_or_path, resume=resume_from_checkpoint)
-            config.resume_path = model_args.model_name_or_path
+            config.resume_path = model_args.model_name_or_path  # 用于LAPE权重加载的基础模型路径
+            config._resume_from_checkpoint = resume_path  # 传递checkpoint路径用于LAPE权重加载
         else:
             config = AutoConfig.from_pretrained(resume_path, trust_remote_code=True)
-            config.resume_path = resume_path
+            config.resume_path = model_args.model_name_or_path  # 修复：用基础模型路径而不是checkpoint路径
+            config._resume_from_checkpoint = resume_path  # 传递checkpoint路径用于LAPE权重加载
             model_cls = eval(config.architectures[0])
     else:
         ## first time training
