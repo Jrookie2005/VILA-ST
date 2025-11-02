@@ -95,7 +95,7 @@ torchrun \
         --deepspeed scripts/zero3.json \
         --model_name_or_path $STAGE_PATH \
         --data_mixture $DATA_MIXTURE \
-        --vision_tower Efficient-Large-Model/paligemma-siglip-so400m-patch14-448 \
+        --vision_tower ../VILA/.cache/huggingface/hub/models--Efficient-Large-Model--paligemma-siglip-so400m-patch14-448/snapshots/5d16503948d9699243d16e93fab44d2fa202371c \
         --mm_vision_select_feature cls_patch \
         --mm_projector mlp_downsample_3x3_fix \
         --tune_vision_tower True \
