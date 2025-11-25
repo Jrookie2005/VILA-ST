@@ -687,21 +687,201 @@ class LlavaMetaModel(ABC):
                 image_features = image_features.reshape(t, hw, -1)
         return image_features
 
-    ## @yunhao: is there a better way to handle function call and attributes for llm?
-    ## support beam search
-    def _temporary_reorder_cache(self, past_key_values, sorted_idx):
-        return self.get_llm()._temporary_reorder_cache(past_key_values, sorted_idx)
+    def prepare_inputs_labels_for_multimodal_video(
+        self, 
+        input_ids, 
+        position_ids, 
+        attention_mask, 
+        past_key_values, 
+        labels, 
+        images, 
+        modalities=["image"], 
+        image_sizes=None,
+        variables=None,
+    ):
+        # orig_embeds_params = getattr(self.get_model(), 'orig_embeds_params', None)
+        orig_embeds_params = None
+        if self.has_init_specific_embeddings:
+            temporal_input_embeddings = reparam(self.temporal_input_embeddings.weight, self.temporal_reparam_mat)
+            temporal_output_embeddings = reparam(self.temporal_output_embeddings.weight, self.temporal_reparam_mat)
+            spatial_height_input_embeddings = reparam(self.spatial_height_input_embeddings.weight, self.spatial_height_reparam_mat)
+            spatial_height_output_embeddings = reparam(self.spatial_height_output_embeddings.weight, self.spatial_height_reparam_mat)
+            spatial_width_input_embeddings = reparam(self.spatial_width_input_embeddings.weight, self.spatial_width_reparam_mat)
+            spatial_width_output_embeddings = reparam(self.spatial_width_output_embeddings.weight, self.spatial_width_reparam_mat)
 
-    def get_input_embeddings(self):
-        return self.get_llm().get_input_embeddings()
+            temporal_information_injection = ((temporal_input_embeddings + temporal_output_embeddings)/2).unsqueeze(1)
+            spatial_height_information_injection = ((spatial_height_input_embeddings + spatial_height_output_embeddings)/2).unsqueeze(1)
+            spatial_width_information_injection = ((spatial_width_input_embeddings + spatial_width_output_embeddings)/2).unsqueeze(1)
 
-    def get_output_embeddings(self):
-        return self.get_llm().get_output_embeddings()
+            device = self.get_input_embeddings().weight.device
+            inputs_embeds = torch.nn.functional.embedding(input_ids, torch.cat(
+                [self.get_input_embeddings().weight, temporal_input_embeddings.to(device), spatial_height_input_embeddings.to(device), spatial_width_input_embeddings.to(device)]
+            ))
+        else:
+            temporal_information_injection = None
+            spatial_height_information_injection = None
+            spatial_width_information_injection = None
+            
+            device = self.get_input_embeddings().weight.device
+            inputs_embeds = torch.nn.functional.embedding(input_ids, self.get_input_embeddings().weight)
+        
+        if (input_ids.shape[1] != 1 or self.training) and images is not None:
 
-    def resize_token_embeddings(self, embed_size):
-        self.get_llm().resize_token_embeddings(embed_size)
+            images_list = []
+            for image in images:
+                if image.ndim == 4:
+                    images_list.append(image)
+                else:
+                    images_list.append(image.unsqueeze(0))
 
-    # LAPE Methods
+            if len(images_list) > 0:
+                concat_images = torch.cat([image for image in images_list], dim=0)
+                split_sizes = [image.shape[0] for image in images_list]
+                encoded_image_features, encoded_fast_image_features = self.encode_images(concat_images, split_sizes, modalities, temporal_information_injection, spatial_height_information_injection, spatial_width_information_injection)
+            else:
+                encoded_image_features, encoded_fast_image_features = None, None
+
+            new_input_embeds = []
+            for cur_video_idx,(cur_input_ids, cur_input_embeds, modality) in enumerate(zip(input_ids, inputs_embeds, modalities)):
+                if modality == 'image':
+                    image_start_tokens = torch.where(cur_input_ids == self.vision_config.im_start_token)[0]
+
+                    for image_start_token_pos in image_start_tokens:
+                        cur_image_features = encoded_image_features[cur_video_idx].to(device=cur_input_embeds.device)
+                        cur_image_features = cur_image_features.flatten(0, 1)
+                        num_patches = cur_image_features.shape[0]
+                        if cur_input_ids[image_start_token_pos + num_patches - 1] != self.vision_config.im_end_token:
+                            raise ValueError("The image end token should follow the image start token.")
+                        if orig_embeds_params is not None:
+                            cur_new_input_embeds = torch.cat((
+                                cur_input_embeds[:image_start_token_pos],
+                                cur_image_features, 
+                                cur_input_embeds[image_start_token_pos + num_patches:],
+                            ), dim=0)
+                        else:
+                            cur_new_input_embeds = torch.cat((
+                                cur_input_embeds[:image_start_token_pos],
+                                cur_image_features,
+                                cur_input_embeds[image_start_token_pos + num_patches:]
+                            ), dim=0)
+
+                elif modality == 'video':
+                    video_start_tokens = torch.where(cur_input_ids == self.vision_config.vid_start_token)[0]
+                    
+                    for video_start_token_pos in video_start_tokens:
+                        cur_video_features = encoded_fast_image_features[cur_video_idx].to(device=cur_input_embeds.device)
+
+                        cur_video_features = cur_video_features.flatten(0, 1)
+                        num_patches = cur_video_features.shape[0]
+                        if cur_input_ids[video_start_token_pos + num_patches - 1] != self.vision_config.vid_end_token:
+                            raise ValueError("The video end token should follow the video start token.")
+                        if orig_embeds_params is not None:
+                            cur_new_input_embeds = torch.cat((
+                                cur_input_embeds[:video_start_token_pos],
+                                cur_video_features, 
+                                cur_input_embeds[video_start_token_pos + num_patches:],
+                            ), dim=0)
+                        else:
+                            cur_new_input_embeds = torch.cat((
+                                cur_input_embeds[:video_start_token_pos],
+                                cur_video_features,
+                                cur_input_embeds[video_start_token_pos + num_patches:]
+                            ), dim=0)
+                        # cur_video_idx += 1
+                    
+                    if self.vision_config.slow_token:
+                        slow_video_start_tokens = torch.where(cur_input_ids == self.vision_config.slow_vid_start_token)[0]
+                        
+                        for video_start_token_pos in slow_video_start_tokens:
+                            cur_video_features = encoded_image_features[cur_video_idx].to(device=cur_input_embeds.device)
+
+                            cur_video_features = cur_video_features.flatten(0, 1)
+                            num_patches = cur_video_features.shape[0]
+                            if cur_input_ids[video_start_token_pos + num_patches - 1] != self.vision_config.slow_vid_end_token:
+                                raise ValueError("The video end token should follow the video start token.")
+                            if orig_embeds_params is not None:
+                                cur_new_input_embeds = torch.cat((
+                                    cur_input_embeds[:video_start_token_pos],
+                                    cur_video_features, 
+                                    cur_input_embeds[video_start_token_pos + num_patches:],
+                                ), dim=0)
+                            else:
+                                cur_new_input_embeds = torch.cat((
+                                    cur_input_embeds[:video_start_token_pos],
+                                    cur_video_features,
+                                    cur_input_embeds[video_start_token_pos + num_patches:]
+                                ), dim=0)
+                    
+                else:
+                    raise ValueError("Unexpected modality besides image and video.")
+                new_input_embeds.append(cur_new_input_embeds)
+
+            inputs_embeds = torch.stack(new_input_embeds, dim=0)
+
+        if (input_ids.shape[1] != 1 or self.training) and variables is not None and all(variables):
+            new_input_embeds = []
+
+            for cur_video_idx, (cur_input_ids, cur_input_embeds, cur_variables) in enumerate(zip(input_ids, inputs_embeds, variables)):
+                cur_temporal_input_locations = cur_variables['temporal_input_locations']
+                cur_temporal_output_locations = cur_variables['temporal_output_locations']
+                cur_spatial_height_input_locations = cur_variables['spatial_height_input_locations']
+                cur_spatial_height_output_locations = cur_variables['spatial_height_output_locations']
+                cur_spatial_width_input_locations = cur_variables['spatial_width_input_locations']
+                cur_spatial_width_output_locations = cur_variables['spatial_width_output_locations']
+
+                cur_new_input_embeds = inputs_embeds[cur_video_idx].clone()
+
+                if (cur_input_ids == self.vision_config.temporal_input_token_id).sum() \
+                    + (cur_input_ids == self.vision_config.temporal_output_token_id).sum() \
+                    + (cur_input_ids == self.vision_config.spatial_height_input_token_id).sum() \
+                    + (cur_input_ids == self.vision_config.spatial_height_output_token_id).sum() \
+                    + (cur_input_ids == self.vision_config.spatial_width_input_token_id).sum() \
+                    + (cur_input_ids == self.vision_config.spatial_width_output_token_id).sum() == 0:
+                    new_input_embeds.append(cur_input_embeds)
+                else:
+                    if (cur_input_ids == self.vision_config.temporal_input_token_id).sum() > len(cur_temporal_input_locations) \
+                        or (cur_input_ids == self.vision_config.temporal_output_token_id).sum() > len(cur_temporal_output_locations):
+                        raise ValueError("The number of temporal tokens and input temporal location features should be the same.")
+                    if (cur_input_ids == self.vision_config.temporal_input_token_id).sum() > len(cur_temporal_input_locations) \
+                        or (cur_input_ids == self.vision_config.temporal_output_token_id).sum() > len(cur_temporal_output_locations) \
+                        or (cur_input_ids == self.vision_config.spatial_height_input_token_id).sum() > len(cur_spatial_height_input_locations) \
+                        or (cur_input_ids == self.vision_config.spatial_height_output_token_id).sum() > len(cur_spatial_height_output_locations) \
+                        or (cur_input_ids == self.vision_config.spatial_width_input_token_id).sum() > len(cur_spatial_width_input_locations) \
+                        or (cur_input_ids == self.vision_config.spatial_width_output_token_id).sum() > len(cur_spatial_width_output_locations):
+                        raise ValueError("The number of spatial tokens and input temporal location features should be the same.")
+                    
+                    temporal_input_token_indices = torch.where(cur_input_ids == self.vision_config.temporal_input_token_id)[0]
+                    temporal_output_token_indices = torch.where(cur_input_ids == self.vision_config.temporal_output_token_id)[0]
+                    for i, index in enumerate(temporal_input_token_indices):
+                        cur_temporal_location_feature = token_transfer(cur_temporal_input_locations[i], temporal_input_embeddings)
+                        cur_new_input_embeds[index] = cur_temporal_location_feature
+                    for i, index in enumerate(temporal_output_token_indices):
+                        cur_temporal_location_feature = token_transfer(cur_temporal_output_locations[i], temporal_input_embeddings)
+                        cur_new_input_embeds[index] = cur_temporal_location_feature
+
+                    spatial_height_input_token_indices = torch.where(cur_input_ids == self.vision_config.spatial_height_input_token_id)[0]
+                    spatial_height_output_token_indices = torch.where(cur_input_ids == self.vision_config.spatial_height_output_token_id)[0]
+                    for i, index in enumerate(spatial_height_input_token_indices):
+                        cur_spatial_height_location_feature = token_transfer(cur_spatial_height_input_locations[i], spatial_height_input_embeddings)
+                        cur_new_input_embeds[index] = cur_spatial_height_location_feature
+                    for i, index in enumerate(spatial_height_output_token_indices):
+                        cur_spatial_height_location_feature = token_transfer(cur_spatial_height_output_locations[i], spatial_height_input_embeddings)
+                        cur_new_input_embeds[index] = cur_spatial_height_location_feature
+
+                    spatial_width_input_token_indices = torch.where(cur_input_ids == self.vision_config.spatial_width_input_token_id)[0]
+                    spatial_width_output_token_indices = torch.where(cur_input_ids == self.vision_config.spatial_width_output_token_id)[0]
+                    for i, index in enumerate(spatial_width_input_token_indices):
+                        cur_spatial_width_location_feature = token_transfer(cur_spatial_width_input_locations[i], spatial_width_input_embeddings)
+                        cur_new_input_embeds[index] = cur_spatial_width_location_feature
+                    for i, index in enumerate(spatial_width_output_token_indices):
+                        cur_spatial_width_location_feature = token_transfer(cur_spatial_width_output_locations[i], spatial_width_input_embeddings)
+                        cur_new_input_embeds[index] = cur_spatial_width_location_feature
+                    
+                    new_input_embeds.append(cur_new_input_embeds)
+            inputs_embeds = torch.stack(new_input_embeds, dim=0)
+
+        return input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels
+
     def init_special_embeddings(self, init_strategy="normal"):
         if self.has_init_specific_embeddings:
             return

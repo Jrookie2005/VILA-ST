@@ -278,6 +278,49 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
 
         return outputs
 
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
+        image_sizes: Optional[torch.Tensor] = None,
+        variables: Optional[list] = None,
+        **kwargs,
+    ) -> Union[torch.LongTensor, CausalLMOutputWithPast]:
+        """
+        A compatibility wrapper for generation functions, similar to llava_qwen.
+        It accepts `images` and `variables` and prepares `inputs_embeds` for the main generation loop.
+        """
+        position_ids = kwargs.pop("position_ids", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        if "inputs_embeds" in kwargs:
+            raise NotImplementedError("`inputs_embeds` is not supported when using `generate` with `images`.")
+
+        # If images are provided, we need to prepare the multimodal embeddings
+        if images is not None:
+            # The _embed method handles the conversion from input_ids + images to inputs_embeds
+            inputs_embeds, labels, attention_mask = self._embed(
+                input_ids=input_ids,
+                media={"image": images},
+                media_config=[{"image_sizes": image_sizes}] if image_sizes is not None else [{}],
+                labels=None,  # No labels during inference
+                attention_mask=attention_mask,
+                variables=variables,
+            )
+            # We need to nullify input_ids as we are passing inputs_embeds
+            input_ids = None
+        else:
+            # If no images, just get the token embeddings
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        # Call the original generate method from the parent class (PreTrainedModel)
+        return super().generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **kwargs,
+        )
+
 
 AutoConfig.register("llava_llama", LlavaLlamaConfig)
 AutoModel.register(LlavaLlamaConfig, LlavaLlamaModel)
