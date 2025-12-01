@@ -121,14 +121,37 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
             media_config = defaultdict(dict)
 
         if inputs_embeds is None:
-            inputs_embeds, labels, attention_mask = self._embed(
-                input_ids,
-                media,
-                media_config,
-                labels,
-                attention_mask,
-                variables=variables,
+            # Check if we have LAPE data (variables field) to decide processing path
+            has_lape_data = variables is not None and len(variables) > 0 and any(
+                v is not None and isinstance(v, dict) and len(v) > 0 for v in variables
             )
+            
+            if has_lape_data:
+                # LAPE processing path: use prepare_inputs_labels_for_multimodal_video
+                print("[LAPE] Using prepare_inputs_labels_for_multimodal_video path (has variables)")
+                # prepare_inputs returns: input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels
+                _, position_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal_video(
+                    input_ids,
+                    position_ids,
+                    attention_mask,
+                    past_key_values,
+                    labels,
+                    media.get("image") if media else None,
+                    modalities=["image"],  # LAPE主要处理图像
+                    image_sizes=None,
+                    variables=variables,
+                )
+            else:
+                # Original VILA processing path: use _embed
+                print("[LAPE] Using _embed path (no variables)")
+                inputs_embeds, labels, attention_mask = self._embed(
+                    input_ids,
+                    media,
+                    media_config,
+                    labels,
+                    attention_mask,
+                    variables=variables,
+                )
 
         if force_packing or (packing and self.training and not dpo_forward):
             if seqlens_in_batch is None:

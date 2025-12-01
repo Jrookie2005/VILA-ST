@@ -1016,6 +1016,10 @@ class LlavaMetaForCausalLM(ABC):
         attention_mask: Optional[torch.Tensor],
         variables: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Original VILA embedding fusion - standard path for non-LAPE data.
+        No LAPE logic, no control tokens, no variables processing.
+        """
         labels = labels if labels is not None else torch.full_like(input_ids, IGNORE_INDEX)
         attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids, dtype=torch.bool)
 
@@ -1026,43 +1030,6 @@ class LlavaMetaForCausalLM(ABC):
 
         # Extract text and media embeddings
         text_embeds = self.llm.model.embed_tokens(input_ids)
-
-        # If variables provided and LAPE is initialized, prepare temporal injection tensors for image encoding
-        # (LLaVA-ST style). We'll apply control-token embedding replacement after removing padding below.
-        if variables is not None and self.has_init_specific_embeddings:
-            batch_size = input_ids.shape[0]
-            device = text_embeds.device
-            dtype = text_embeds.dtype
-
-            # Collect per-image temporal injection vectors in the same flattened order as collator flattens media
-            temporal_injection_list: List[torch.Tensor] = []
-            image_token_id = self.tokenizer.media_token_ids.get("image")
-
-            for k in range(batch_size):
-                vars_k = variables[k] if isinstance(variables, list) and k < len(variables) else None
-
-                # Prepare temporal injection vector per image occurrence for this instance (use first temporal input if available)
-                if image_token_id is not None:
-                    num_images = (input_ids[k] == image_token_id).sum().item()
-                else:
-                    num_images = 0
-                if num_images > 0:
-                    if vars_k is not None and len(vars_k.get("temporal_input_locations", [])) > 0:
-                        tval = float(vars_k["temporal_input_locations"][0])
-                        tvec = token_transfer(tval, self.temporal_input_embeddings.weight).to(device=device, dtype=dtype)
-                    else:
-                        # fallback: zero vector
-                        tvec = torch.zeros(self.llm.config.hidden_size, device=device, dtype=dtype)
-                    # repeat for each image token of this instance
-                    for _ in range(num_images):
-                        temporal_injection_list.append(tvec)
-
-            # Attach temporal injection into media_config for image encoder to consume
-            if len(temporal_injection_list) > 0:
-                media_config = copy.deepcopy(media_config) if media_config is not None else defaultdict(dict)
-                media_config.setdefault("image", {})
-                media_config["image"]["temporal_information_injection"] = torch.stack(temporal_injection_list, dim=0)
-
         media_embeds = self.__embed_media_tokens(media, media_config)
 
         if PROCESS_GROUP_MANAGER is not None:
@@ -1084,34 +1051,6 @@ class LlavaMetaForCausalLM(ABC):
         batch_size = labels.shape[0]
         text_embeds = [text_embeds[k][attention_mask[k]] for k in range(batch_size)]
         labels = [labels[k][attention_mask[k]] for k in range(batch_size)]
-
-        # Now apply control-token embedding replacement on the unpadded sequences
-        if variables is not None and self.has_init_specific_embeddings:
-            for k in range(batch_size):
-                vars_k = variables[k] if isinstance(variables, list) and k < len(variables) else None
-                if vars_k is None:
-                    continue
-                ids_k = input_ids[k][attention_mask[k]]
-                emb_k = text_embeds[k]
-                device = emb_k.device
-                dtype = emb_k.dtype
-
-                def _replace_embeddings_for_token(pos_token_id: int, values: List[float], table: torch.nn.Embedding):
-                    if pos_token_id < 0 or values is None:
-                        return
-                    ptr = 0
-                    for pos_idx in range(ids_k.shape[0]):
-                        if ids_k[pos_idx].item() == pos_token_id:
-                            if ptr < len(values):
-                                v = float(values[ptr])
-                                vec = token_transfer(v, table.weight).to(device=device, dtype=dtype)
-                                emb_k[pos_idx] = vec
-                            ptr += 1
-
-                vc = self.vision_config
-                _replace_embeddings_for_token(vc.temporal_input_token_id, vars_k.get("temporal_input_locations", []), self.temporal_input_embeddings)
-                _replace_embeddings_for_token(vc.spatial_height_input_token_id, vars_k.get("spatial_height_input_locations", []), self.spatial_height_input_embeddings)
-                _replace_embeddings_for_token(vc.spatial_width_input_token_id, vars_k.get("spatial_width_input_locations", []), self.spatial_width_input_embeddings)
 
         # Build inverse mapping from token ID to media name
         media_tokens = {}
