@@ -143,7 +143,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
                 )
             else:
                 # Original VILA processing path: use _embed
-                print("[LAPE] Using _embed path (no variables)")
+                # print("[LAPE] Using _embed path (no variables)")
                 inputs_embeds, labels, attention_mask = self._embed(
                     input_ids,
                     media,
