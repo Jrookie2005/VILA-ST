@@ -974,14 +974,14 @@ class LlavaMetaModel(ABC):
         self.spatial_height_tokens = [SPATIAL_HEIGHT_TOKEN_FORMAT.format(i) for i in range(num_spatial_tokens)]
         self.spatial_width_tokens = [SPATIAL_WIDTH_TOKEN_FORMAT.format(i) for i in range(num_spatial_tokens)]
         
-        # Add special tokens
+        # Add special control tokens (6 tokens)
         num_new_tokens = tokenizer.add_tokens([
             TEMPORAL_INPUT_TOKEN, TEMPORAL_OUTPUT_TOKEN, 
             SPATIAL_HEIGHT_INPUT_TOKEN, SPATIAL_HEIGHT_OUTPUT_TOKEN, 
             SPATIAL_WIDTH_INPUT_TOKEN, SPATIAL_WIDTH_OUTPUT_TOKEN
         ], special_tokens=True)
         
-        # Get token IDs
+        # Get token IDs for control tokens
         vision_config.temporal_input_token_id = tokenizer.convert_tokens_to_ids([TEMPORAL_INPUT_TOKEN])[0]
         vision_config.temporal_output_token_id = tokenizer.convert_tokens_to_ids([TEMPORAL_OUTPUT_TOKEN])[0]
         vision_config.spatial_height_input_token_id = tokenizer.convert_tokens_to_ids([SPATIAL_HEIGHT_INPUT_TOKEN])[0]
@@ -989,10 +989,10 @@ class LlavaMetaModel(ABC):
         vision_config.spatial_width_input_token_id = tokenizer.convert_tokens_to_ids([SPATIAL_WIDTH_INPUT_TOKEN])[0]
         vision_config.spatial_width_output_token_id = tokenizer.convert_tokens_to_ids([SPATIAL_WIDTH_OUTPUT_TOKEN])[0]
         
-        # Add position tokens
-        _ = tokenizer.add_tokens(self.temporal_tokens, special_tokens=True)
-        _ = tokenizer.add_tokens(self.spatial_height_tokens, special_tokens=True)
-        _ = tokenizer.add_tokens(self.spatial_width_tokens, special_tokens=True)
+        # Add position tokens and accumulate count
+        num_new_tokens += tokenizer.add_tokens(self.temporal_tokens, special_tokens=True)
+        num_new_tokens += tokenizer.add_tokens(self.spatial_height_tokens, special_tokens=True)
+        num_new_tokens += tokenizer.add_tokens(self.spatial_width_tokens, special_tokens=True)
 
         # Neighboring Token Propagation (NTP)
         index_vec = torch.arange(num_spatial_tokens)
@@ -1003,6 +1003,11 @@ class LlavaMetaModel(ABC):
 
         self.config.num_spatial_tokens = self.num_spatial_tokens
         self.config.num_temporal_tokens = self.num_temporal_tokens
+        
+        print(f"[LAPE Debug] Added tokens breakdown: 6 control tokens + {len(self.temporal_tokens)} temporal + {len(self.spatial_height_tokens)} height + {len(self.spatial_width_tokens)} width = {num_new_tokens} total")
+        print(f"[LAPE Debug] Control token IDs: temporal_in={vision_config.temporal_input_token_id}, temporal_out={vision_config.temporal_output_token_id}")
+        print(f"[LAPE Debug] Tokenizer vocab size: {len(tokenizer)}")
+        
         return num_new_tokens
 
 
